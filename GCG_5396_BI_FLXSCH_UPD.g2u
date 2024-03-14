@@ -1,0 +1,93 @@
+Program.Sub.Preflight.Start
+Program.Sub.Preflight.End
+
+Program.Sub.Main.Start
+
+F.Intrinsic.Control.Try
+	V.Local.sError.Declare(String," ")
+	'coded for controlled automation from quote 10893
+	'coded by SFF 12/31/2018
+	'this will launch from the BI hook 16090 and it will update the flex schedule MAT_QTY and SEQ_QTY fields for all work orders being printed in that instance by terminal#. 
+	'this is being done specifically for their scenario and formula fields that are in place for Instructions.
+	v.Local.sSQL.Declare(String)
+	v.Local.i.Declare(long)
+	
+	f.Intrinsic.Control.If(v.Caller.Hook,=,16090)
+	f.Intrinsic.Control.AndIf(v.Passed.BIP_REPORTID,=,"001808")
+		'open connection
+		f.ODBC.Connection!con.opencompanyconnection(120)
+		
+		'update MATL_QTY
+		f.Intrinsic.String.Build("update LASER_NC_LABOR a set a.MATL_QTY = (select b.MATL_QTY from LASER_NC_LABOR b where b.terminal = '{0}' and b.MATL_QTY > 0 and a.WO = b.WO and a.WO_SUF = b.WO_SUF and a.WO_SEQ = b.WO_SEQ) where a.terminal = '{0}'",v.Caller.Terminal,v.Local.sSQL)
+		f.ODBC.Connection!con.execute(v.Local.sSQL)
+		
+		'update SEQ_QTY
+		f.Intrinsic.String.Build("update LASER_NC_LABOR a set a.SEQ_QTY = (select b.SEQ_QTY from LASER_NC_LABOR b where b.terminal = '{0}' and b.SEQ_QTY > 0 and a.WO = b.WO and a.WO_SUF = b.WO_SUF and a.WO_SEQ = b.WO_SEQ) where a.terminal = '{0}'",v.Caller.Terminal,v.Local.sSQL)
+		f.ODBC.Connection!con.execute(v.Local.sSQL)
+			
+		
+		'for each job_suf_seq combination: query for parent wo + suffix, then get part from job header for that parent. then get the first labor step, display both at top right of flex schedule report.
+		f.Intrinsic.String.Build("Select distinct WO, WO_SUF, WO+'-'+WO_SUF as JobSuf from LASER_NC_LABOR where terminal = '{0}' ",v.Caller.Terminal,v.Local.sSQL)
+		f.data.DataTable.CreateFromSQL("flxJobs","con",v.Local.sSQL)
+		f.Data.DataTable.AddColumn("flxJobs","ParentJob","String")
+		f.Data.DataTable.AddColumn("flxJobs","ParentPart","String")
+		f.Data.DataTable.AddColumn("flxJobs","FirstWCofParent","String")
+		f.Data.DataTable.AddColumn("flxJobs","Terminal","String")
+		f.Data.DataTable.AddColumn("flxJobs","RowID","String")
+		
+		'load parent jobs
+		f.Data.DataTable.CreateFromSQL("ParentJobs","con","Select Job+'-'+Suffix as Job, if(Parent_WO = '','na',Parent_WO)+'-'+Parent_Suffix_Parent as ParentJob from v_JOB_HEADER")
+		'Function.Data.Dictionary.CreateFromDataTable(dictionary name [string], datatable name [string], key column [string], value column [string])
+		
+		'Part as ParentPart, Parent_WO+'-'+Parent_Suffix_Parent as ParentJob from v_JOB_HEADER
+		f.Data.DataTable.CreateFromSQL("ParentParts","con","Select Job+'-'+Suffix as ParentJob, Part as ParentPart from v_JOB_HEADER")
+		
+		'load the parent parts and parent wo-suffix info from dictionaries tot he main table
+		f.Data.Dictionary.CreateFromDataTable("dParentJobs","ParentJobs","Job","ParentJob")
+		f.Data.Dictionary.CreateFromDataTable("dParentParts","ParentParts","ParentJob","ParentPart")
+		F.Data.Dictionary.SetDefaultReturn("dParentJobs"," ")
+		F.Data.Dictionary.SetDefaultReturn("dParentParts"," ")
+		f.Data.DataTable.FillFromDictionary("flxJobs","dParentJobs","JobSuf","ParentJob")
+		f.Data.DataTable.FillFromDictionary("flxJobs","dParentParts","ParentJob","ParentPart")
+		
+		
+		'now loop through and get first labor step for each parent job and fill in column on flxjobs table
+		f.Intrinsic.Control.For(v.Local.i,0,v.DataTable.flxJobs.RowCount--,1)
+			f.Intrinsic.String.Build("Select top 1 part as WC from v_JOB_OPERATIONS where JOB+'-'+SUFFIX = '{0}' and LMO = 'L' order by SEQ asc",v.DataTable.flxJobs(v.Local.i).ParentJob!FieldVal,v.Local.sSQL)
+			f.ODBC.Connection!con.openrecordsetro("rstWC",v.Local.sSQL)
+			f.Intrinsic.Control.if(v.ODBC.con!rstWC.EOF,<>,true)
+				f.Data.DataTable.SetValue("flxJobs",v.Local.i,"FirstWCofParent",v.ODBC.con!rstWC.FieldVal!WC)
+			f.Intrinsic.Control.EndIf
+			'set terminal#
+			f.Data.DataTable.SetValue("flxJobs",v.Local.i,"Terminal",v.Caller.Terminal)
+			f.Data.DataTable.SetValue("flxJobs",v.Local.i,"RowID",v.Local.i.String)
+			f.ODBC.con!rstWC.Close
+		f.Intrinsic.Control.Next(v.Local.i)
+		
+		f.Intrinsic.Control.If(v.DataTable.flxJobs.RowCount--,<>,-1)
+			f.Intrinsic.String.Build("delete from GCG_5396_FLX_AUX where Terminal = '{0}'",v.Caller.Terminal,v.Local.sSQL)
+			f.ODBC.Connection!con.execute(v.Local.sSQL)
+			f.Data.DataTable.SaveToDB("flxJobs","con","GCG_5396_FLX_AUX","RowID",128)
+		f.Intrinsic.Control.EndIf
+		
+		'close connection
+		f.ODBC.Connection!con.Close
+
+'		
+'		'update RAW_MATL from CODE_SORT_OPER on matching SEQ for M records in the LASER NC LABOR TABLE ONLY.
+'		f.Intrinsic.String.Build("update LASER_NC_LABOR a set a.RAW_MATL = (select part from v_JOB_OPERATIONS where job = a.wo and suffix = a.wo_suf and seq = (Select code_sort_oper from v_job_operations where job = a.wo and suffix = a.wo_suf and seq = a.wo_seq)) where a.terminal = '{0}' and LMO = 'M' ",v.Caller.Terminal,v.Local.sSQL)
+'		f.ODBC.Connection!con.execute(v.Local.sSQL)
+		
+	f.Intrinsic.Control.EndIf
+
+
+	F.Intrinsic.Control.ExitSub
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.If(V.Ambient.ErrorNumber,<>,0)
+		F.Intrinsic.String.Build("Project: {0}{1}Subroutine: {2}{1}Error Occurred {3} with description {4}","",V.Ambient.NewLine,V.Ambient.CurrentSubroutine,V.Ambient.ErrorNumber,V.Ambient.ErrorDescription,V.Local.sError)
+		F.Intrinsic.UI.Msgbox(V.Local.sError)
+	F.Intrinsic.Control.EndIf
+Function.Intrinsic.Control.EndTry
+
+Program.Sub.Main.End
